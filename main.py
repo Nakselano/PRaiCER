@@ -10,7 +10,14 @@ from scraper import search_products_shallow, scrape_product_deep
 from ai_service import analyze_reviews_with_gemini, generate_ai_response
 from rag_engine import rag
 from tools import TOOLS_MAP, TOOLS_DESC
+from contextlib import asynccontextmanager
 import uvicorn
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    SQLModel.metadata.create_all(engine)
+    yield
+
 app = FastAPI()
 
 origins = [
@@ -222,4 +229,5 @@ async def chat_endpoint(req: ChatRequest):
 if __name__ == "__main__":
     create_db_and_tables()
     print("Serwer na http://0.0.0.0:8000")
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
