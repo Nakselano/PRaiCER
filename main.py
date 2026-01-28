@@ -15,7 +15,7 @@ import uvicorn
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    SQLModel.metadata.create_all(engine)
+    create_db_and_tables()
     yield
 
 app = FastAPI()
@@ -231,3 +231,4 @@ if __name__ == "__main__":
     print("Serwer na http://0.0.0.0:8000")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
