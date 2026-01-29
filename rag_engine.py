@@ -11,7 +11,6 @@ DEFAULT_DOC_ID = os.getenv("GOOGLE_DOC_ID")
 
 class RagEngine:
     def __init__(self, doc_id: str = DEFAULT_DOC_ID):
-        print("⏳ RAG: Ładowanie modelu embeddingów (może chwilę potrwać)...")
         self.embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         self.dimension = 384
         self.index = faiss.IndexFlatL2(self.dimension)

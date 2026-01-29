@@ -26,6 +26,8 @@ class SecurityGuard:
         return cleaned_text
 
     def check_prompt_leakage(self, text: str) -> bool:
+        if not text:
+            return False
         text_lower = text.lower()
         for phrase in self.forbidden_phrases:
             if phrase.lower() in text_lower:
