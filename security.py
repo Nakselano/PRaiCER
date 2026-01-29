@@ -8,7 +8,7 @@ class SecurityGuard:
         self.secret_patterns = [
             r"AIza[0-9A-Za-z-_]{35}",  # Google API Key
             r"gsk-[a-zA-Z0-9]{48}",  # OpenAI/Groq Key patterns
-            r"postgres:\/\/",  # Connection strings
+            r"postgres:\/\/[^@]+@\S+",  # Connection strings
         ]
 
         self.forbidden_phrases = [

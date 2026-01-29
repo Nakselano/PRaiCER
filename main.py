@@ -140,7 +140,7 @@ def security_guardrail(text: str) -> bool:
         return False
     return True
 
-MAX_TOOL_OUTPUT_CHARS = 2000
+MAX_TOOL_OUTPUT_CHARS = 8000
 
 def truncate_tool_output(output: str, max_len: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     if len(output) > max_len:
@@ -153,7 +153,7 @@ async def chat_endpoint(req: ChatRequest):
     provider = req.provider
     rag_context = rag.search(last_user_msg, k=2)
 
-    if not guard.check_path_traversal(last_user_msg):
+    if guard.check_path_traversal(last_user_msg):
         raise HTTPException(status_code=400, detail="Wykryto niedozwolone znaki w zapytaniu.")
 
     if not security_guardrail(last_user_msg):
@@ -213,26 +213,24 @@ async def chat_endpoint(req: ChatRequest):
         return {"response": final_answer, "provider_used": provider, "rag_context_used": False}
     ai_response_text = guard.sanitize_output(ai_response_text)
     final_answer = ai_response_text
+    tool_executed = False
     if '"tool":' in ai_response_text:
-        tool_data = guard.validate_json_only(ai_response_text)
         try:
             json_match = re.search(r'(\{.*"tool":.*\})', ai_response_text, re.DOTALL)
             if json_match:
                 json_str = json_match.group(1)
+                json_str = re.sub(r'```(?:json)?', '', json_str).replace('```', '').strip()
                 tool_call = json.loads(json_str)
                 tool_name = tool_call.get("tool")
                 tool_args = tool_call.get("args", {})
 
                 if tool_name in TOOLS_MAP:
                     print(f"🔧 DISPATCHER: Wywołanie {tool_name}...")
-
                     tool_result_raw = TOOLS_MAP[tool_name](tool_args)
-
                     tool_result_safe = truncate_tool_output(str(tool_result_raw))
-
                     try:
                         res_json = json.loads(tool_result_safe)
-                        if res_json.get("status") == "error":
+                        if isinstance(res_json,dict) and res_json.get("status") == "error":
                             code = res_json.get("code")
                             if code == "TIMEOUT":
                                 final_answer = "Baza danych odpowiada zbyt wolno."
@@ -242,12 +240,17 @@ async def chat_endpoint(req: ChatRequest):
                                 final_answer = f"Błąd techniczny: {res_json.get('message')}"
                         else:
                             follow_up_prompt = f"""
-                                {system_prompt}
-                                WYNIK NARZĘDZIA ({tool_name}):
-                                {tool_result_safe}
-                                Odpowiedz krótko użytkownikowi na podstawie powyższych danych.
-                                """
-                            final_answer = generate_ai_response(follow_up_prompt, provider=provider)
+                            {system_prompt}
+                            
+                            WYNIK Z BAZY DANYCH:
+                            {tool_result_safe}
+                            
+                            Napisz użytkownikowi JEDNO krótkie zdanie, np. "Oto znaleziony iPhone 15".
+                            NIE WYPISUJ CENY ANI PARAMETRÓW W TEKŚCIE (są w karcie poniżej).
+                            """
+                            ai_intro_text = generate_ai_response(follow_up_prompt, provider=provider)
+                            final_answer = f"{ai_intro_text}\n\n{tool_result_safe}"
+                            tool_executed = True
                     except json.JSONDecodeError:
                         final_answer = f"Dane: {tool_result_safe}"
                 else:
@@ -255,7 +258,8 @@ async def chat_endpoint(req: ChatRequest):
         except Exception as e:
             print(f"❌ Błąd dispatchera: {e}")
             final_answer = "Wystąpił błąd podczas przetwarzania zapytania."
-    final_answer = guard.sanitize_output(final_answer)
+    if not tool_executed:
+        final_answer = guard.sanitize_output(final_answer)
     return {
         "response": final_answer,
         "provider_used": provider,
