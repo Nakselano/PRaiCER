@@ -10,8 +10,8 @@ from scraper import search_products_shallow, scrape_product_deep
 from ai_service import analyze_reviews_with_gemini, generate_ai_response
 from rag_engine import rag
 from tools import TOOLS_MAP, TOOLS_DESC
-from contextlib import asynccontextmanager
 import uvicorn
+from security import guard
 
 create_db_and_tables()
 
@@ -140,12 +140,21 @@ def security_guardrail(text: str) -> bool:
         return False
     return True
 
+MAX_TOOL_OUTPUT_CHARS = 2000
+
+def truncate_tool_output(output: str, max_len: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    if len(output) > max_len:
+        return output[:max_len] + f"\n... [Przycięto {len(output)-max_len} znaków]"
+    return output
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
 
     last_user_msg = req.messages[-1].content if req.messages else ""
     provider = req.provider
     rag_context = rag.search(last_user_msg, k=2)
+
+    if not guard.check_path_traversal(last_user_msg):
+        raise HTTPException(status_code=400, detail="Wykryto niedozwolone znaki w zapytaniu.")
 
     if not security_guardrail(last_user_msg):
         raise HTTPException(status_code=400, detail="Zapytanie zablokowane.")
@@ -197,26 +206,56 @@ async def chat_endpoint(req: ChatRequest):
         """
     full_prompt = f"{system_prompt}\n\nHISTORIA ROZMOWY:\n{history_str}\nAsystent:"
     ai_response_text = generate_ai_response(full_prompt, provider=provider)
+
+    if guard.check_prompt_leakage(ai_response_text):
+        print("AI próbowało ujawnić System Prompt!")
+        final_answer = "Przepraszam, nie mogę udzielić tej informacji ze względów bezpieczeństwa."
+        return {"response": final_answer, "provider_used": provider, "rag_context_used": False}
+    ai_response_text = guard.sanitize_output(ai_response_text)
     final_answer = ai_response_text
     if '"tool":' in ai_response_text:
+        tool_data = guard.validate_json_only(ai_response_text)
         try:
             json_match = re.search(r'(\{.*"tool":.*\})', ai_response_text, re.DOTALL)
             if json_match:
                 json_str = json_match.group(1)
-                data = json.loads(json_str)
-                tool_name = data.get("tool")
-                tool_args = data.get("args")
-                if tool_name in TOOLS_MAP:
-                    print(f"🔧 Wykonuję narzędzie: {tool_name} z args: {tool_args}")
-                    result = TOOLS_MAP[tool_name](tool_args)
-                    final_answer = f"{result}"
-                else:
-                    final_answer = f"Model próbował użyć nieznanego narzędzia: {tool_name}"
-            else:
-                pass
-        except Exception as e:
-            print(f"{e}")
+                tool_call = json.loads(json_str)
+                tool_name = tool_call.get("tool")
+                tool_args = tool_call.get("args", {})
 
+                if tool_name in TOOLS_MAP:
+                    print(f"🔧 DISPATCHER: Wywołanie {tool_name}...")
+
+                    tool_result_raw = TOOLS_MAP[tool_name](tool_args)
+
+                    tool_result_safe = truncate_tool_output(str(tool_result_raw))
+
+                    try:
+                        res_json = json.loads(tool_result_safe)
+                        if res_json.get("status") == "error":
+                            code = res_json.get("code")
+                            if code == "TIMEOUT":
+                                final_answer = "Baza danych odpowiada zbyt wolno."
+                            elif code == "NOT_FOUND":
+                                final_answer = "Nie znalazłem takiego produktu."
+                            else:
+                                final_answer = f"Błąd techniczny: {res_json.get('message')}"
+                        else:
+                            follow_up_prompt = f"""
+                                {system_prompt}
+                                WYNIK NARZĘDZIA ({tool_name}):
+                                {tool_result_safe}
+                                Odpowiedz krótko użytkownikowi na podstawie powyższych danych.
+                                """
+                            final_answer = generate_ai_response(follow_up_prompt, provider=provider)
+                    except json.JSONDecodeError:
+                        final_answer = f"Dane: {tool_result_safe}"
+                else:
+                    final_answer = f"Błąd: Nieznane narzędzie {tool_name}."
+        except Exception as e:
+            print(f"❌ Błąd dispatchera: {e}")
+            final_answer = "Wystąpił błąd podczas przetwarzania zapytania."
+    final_answer = guard.sanitize_output(final_answer)
     return {
         "response": final_answer,
         "provider_used": provider,

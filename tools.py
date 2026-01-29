@@ -1,8 +1,30 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlmodel import Session, select
-from models import Product, Offer
+from models import Product, Offer, Insight
 from database import engine
 import json
+import concurrent.futures
+import functools
+
+MAX_TEXT_LENGTH = 500
+
+def with_timeout(seconds: int):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(func, *args, **kwargs)
+                    return future.result(timeout=seconds)
+            except concurrent.futures.TimeoutError:
+                return json.dumps(
+                    {"status": "error", "code": "TIMEOUT", "message": f"Przekroczono czas operacji ({seconds}s)."})
+            except ValidationError as ve:
+                return json.dumps({"status": "error", "code": "VALIDATION_ERROR", "message": str(ve)})
+            except Exception as e:
+                return json.dumps({"status": "error", "code": "TOOL_ERROR", "message": str(e)})
+        return wrapper
+    return decorator
 
 class ProductInput(BaseModel):
     product_name: str = Field(..., description="Nazwa produktu, o który pyta użytkownik")
@@ -11,19 +33,25 @@ class InstallmentInput(BaseModel):
     price: float = Field(..., gt=0)
     months: int = Field(..., ge=3, le=48)
 
-
+@with_timeout(5)
 def tool_get_product_details(args: dict) -> str:
-    try:
-        from models import Insight
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                return json.dumps({"status": "error", "code": "VALIDATION_ERROR", "message": "Argumenty nie są JSONem"})
         params = ProductInput(**args)
         search_term = params.product_name.strip()
         with Session(engine) as session:
             statement = select(Product).where(Product.name.ilike(f"%{search_term}%")).order_by(Product.id.desc())
             prod = session.exec(statement).first()
             if not prod:
-                return f"Błąd: Nie znaleziono produktu {search_term}"
+                return json.dumps({"status": "error", "code": "NOT_FOUND", "message": f"Nie znaleziono produktu '{search_term}'."})
             offers = session.exec(select(Offer).where(Offer.product_id == prod.id)).all()
             insight = session.exec(select(Insight).where(Insight.product_id == prod.id)).first()
+
+            summary_text = (insight.summary[:MAX_TEXT_LENGTH] + "...") if insight and insight.summary and len(
+                insight.summary) > MAX_TEXT_LENGTH else (insight.summary if insight else "Brak analizy.")
 
             data = {
                 "type": "product_report",
@@ -31,7 +59,7 @@ def tool_get_product_details(args: dict) -> str:
                 "name": prod.name,
                 "price": float(prod.price),
                 "image": prod.image_url,
-                "summary": insight.summary if insight else "Brak analizy.",
+                "summary": summary_text,
                 "pros": insight.pros if insight else "Brak danych.",
                 "cons": insight.cons if insight else "Brak danych.",
 
@@ -52,18 +80,19 @@ def tool_get_product_details(args: dict) -> str:
                 ]
             }
             return json.dumps(data, ensure_ascii=False)
-    except Exception as e:
-        return f"{e}"
 
 
+@with_timeout(1)
 def tool_calculate_installment(args: dict) -> str:
-    try:
+    if isinstance(args, str):
+        try: args = json.loads(args)
+        except: pass
         params = InstallmentInput(**args)
         monthly = params.price / params.months
-        return f"Symulacja raty dla kwoty {params.price} zł: **{monthly:.2f} zł** miesięcznie ({params.months} rat)."
-    except Exception as e:
-        return f"Błąd obliczeń: {e}"
-
+        return json.dumps({
+            "status": "success",
+            "details": f"Rata: {monthly:.2f} zł miesięcznie ({params.months} rat) dla kwoty {params.price} zł."
+        }, ensure_ascii=False)
 
 TOOLS_MAP = {
     "get_product_details": tool_get_product_details,
